@@ -1,0 +1,1238 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>메이크메이트 레이저 스튜디오</title>
+  
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- React & ReactDOM -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  
+  <!-- Babel -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- Turf.js (사전 로드: 합치기 기능 안정화 및 망 차단 방지) -->
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useRef, useCallback, useEffect } = React;
+
+    // ============================================================================
+    // 1. GEOMETRY & MATH UTILITIES
+    // ============================================================================
+    const dist = (p1, p2) => Math.hypot(p1.x - p2.x, p1.y - p2.y);
+
+    const distToSegment = (p, a, b) => {
+      const l2 = (b.x - a.x) ** 2 + (b.y - a.y) ** 2;
+      if (l2 === 0) return dist(p, a);
+      let t = ((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / l2;
+      t = Math.max(0, Math.min(1, t));
+      return dist(p, { x: a.x + t * (b.x - a.x), y: a.y + t * (b.y - a.y) });
+    };
+
+    const minDistToPolygon = (p, poly) => {
+      let minD = Infinity;
+      for (let i = 0; i < poly.length; i++) {
+        const a = poly[i];
+        const b = poly[(i + 1) % poly.length];
+        const d = distToSegment(p, a, b);
+        if (d < minD) minD = d;
+      }
+      return minD;
+    };
+
+    const isPointInPolygon = (p, poly) => {
+      if (!poly || poly.length < 3) return false;
+      let inside = false;
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const xi = poly[i].x, yi = poly[i].y;
+        const xj = poly[j].x, yj = poly[j].y;
+        const intersect =
+          yi > p.y !== yj > p.y &&
+          p.x < ((xj - xi) * (p.y - yi)) / (yj - yi + 1e-10) + xi;
+        if (intersect) inside = !inside;
+      }
+      return inside;
+    };
+
+    const getPolygonBounds = (poly) => {
+      if (!poly || poly.length === 0) {
+        return { minX: 0, minY: 0, maxX: 100, maxY: 100, cx: 50, cy: 50, width: 100, height: 100 };
+      }
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      poly.forEach((p) => {
+        if (p.x < minX) minX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y > maxY) maxY = p.y;
+      });
+      return { minX, minY, maxX, maxY, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2, width: maxX - minX, height: maxY - minY };
+    };
+
+    const getCompoundBounds = (paths) => {
+      if (!paths || paths.length === 0) return null;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      paths.forEach(p => {
+        const b = getPolygonBounds(p.points);
+        if (b.minX < minX) minX = b.minX;
+        if (b.minY < minY) minY = b.minY;
+        if (b.maxX > maxX) maxX = b.maxX;
+        if (b.maxY > maxY) maxY = b.maxY;
+      });
+      if (minX === Infinity) return null;
+      return { minX, minY, maxX, maxY, width: maxX - minX, height: maxY - minY, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
+    };
+
+    const simplifyPath = (points, tolerance = 0.8) => {
+      if (points.length <= 2) return points;
+      let maxDist = 0;
+      let index = 0;
+      const end = points.length - 1;
+      for (let i = 1; i < end; i++) {
+        const d = distToSegment(points[i], points[0], points[end]);
+        if (d > maxDist) { index = i; maxDist = d; }
+      }
+      if (maxDist > tolerance) {
+        const left = simplifyPath(points.slice(0, index + 1), tolerance);
+        const right = simplifyPath(points.slice(index), tolerance);
+        return [...left.slice(0, left.length - 1), ...right];
+      } else {
+        return [points[0], points[end]];
+      }
+    };
+
+    const smoothPath = (points, closed = false, iterations = 1) => {
+      if (points.length < 3) return points;
+      let current = [...points];
+      for (let iter = 0; iter < iterations; iter++) {
+        const next = [];
+        const len = current.length;
+        if (!closed) next.push(current[0]);
+        const limit = closed ? len : len - 1;
+        for (let i = 0; i < limit; i++) {
+          const p0 = current[i];
+          const p1 = current[(i + 1) % len];
+          next.push({ x: 0.75 * p0.x + 0.25 * p1.x, y: 0.75 * p0.y + 0.25 * p1.y });
+          next.push({ x: 0.25 * p0.x + 0.75 * p1.x, y: 0.25 * p0.y + 0.75 * p1.y });
+        }
+        if (!closed) next.push(current[len - 1]);
+        current = next;
+      }
+      return current;
+    };
+
+    const flattenBezier = (nodes, closed) => {
+      const result = [];
+      const steps = 20; 
+      if(nodes.length === 0) return result;
+      for (let i = 0; i < nodes.length - (closed ? 0 : 1); i++) {
+        const n1 = nodes[i];
+        const n2 = nodes[(i + 1) % nodes.length];
+        const p0 = { x: n1.x, y: n1.y }, p1 = { x: n1.outX, y: n1.outY }, p2 = { x: n2.inX, y: n2.inY }, p3 = { x: n2.x, y: n2.y };
+        for (let t = 0; t < (i === nodes.length - 1 && !closed ? steps + 1 : steps); t++) {
+           const u = t / steps;
+           const cx = 3 * (p1.x - p0.x), bx = 3 * (p2.x - p1.x) - cx, ax = p3.x - p0.x - cx - bx;
+           const x = ax * u * u * u + bx * u * u + cx * u + p0.x;
+           const cy = 3 * (p1.y - p0.y), by = 3 * (p2.y - p1.y) - cy, ay = p3.y - p0.y - cy - by;
+           const y = ay * u * u * u + by * u * u + cy * u + p0.y;
+           result.push({ x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) });
+        }
+      }
+      if (!closed) result.push({ x: nodes[nodes.length - 1].x, y: nodes[nodes.length - 1].y });
+      return result;
+    };
+
+    // ============================================================================
+    // 2. PRESET SHAPE TEMPLATES (Size: 60% of workspace)
+    // ============================================================================
+    const createShapeTemplate = (type, boardSize = 100) => {
+      const cx = boardSize / 2;
+      const cy = boardSize / 2;
+      const r = boardSize * 0.3; 
+      const pts = [];
+
+      if (type === 'circle') {
+        const steps = 64;
+        for (let i = 0; i < steps; i++) {
+          const a = (i / steps) * Math.PI * 2;
+          pts.push({ x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r });
+        }
+      } else if (type === 'rounded_rect') {
+        const w = r * 1.85, h = r * 1.85, cr = r * 0.35;
+        const corners = [
+          { x: cx + w / 2 - cr, y: cy - h / 2 + cr, start: -Math.PI / 2, end: 0 },
+          { x: cx + w / 2 - cr, y: cy + h / 2 - cr, start: 0, end: Math.PI / 2 },
+          { x: cx - w / 2 + cr, y: cy + h / 2 - cr, start: Math.PI / 2, end: Math.PI },
+          { x: cx - w / 2 + cr, y: cy - h / 2 + cr, start: Math.PI, end: (Math.PI * 3) / 2 },
+        ];
+        corners.forEach((c) => {
+          for (let i = 0; i <= 12; i++) {
+            const a = c.start + (i / 12) * (c.end - c.start);
+            pts.push({ x: c.x + Math.cos(a) * cr, y: c.y + Math.sin(a) * cr });
+          }
+        });
+      } else if (type === 'heart') {
+        const steps = 72;
+        const scale = r / 15.5;
+        for (let i = 0; i < steps; i++) {
+          const t = (i / steps) * Math.PI * 2;
+          const x = 16 * Math.pow(Math.sin(t), 3);
+          const y = -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t));
+          pts.push({ x: cx + x * scale, y: cy - 2 + y * scale });
+        }
+      } else if (type === 'star') {
+        const spikes = 5;
+        const outerR = r * 1.05, innerR = r * 0.52;
+        const rawPts = [];
+        for (let i = 0; i < spikes * 2; i++) {
+          const rad = i % 2 === 0 ? outerR : innerR;
+          const a = (i / (spikes * 2)) * Math.PI * 2 - Math.PI / 2;
+          rawPts.push({ x: cx + Math.cos(a) * rad, y: cy + Math.sin(a) * rad });
+        }
+        return smoothPath(rawPts, true, 2);
+      } else if (type === 'cat') {
+        const steps = 72;
+        for (let i = 0; i < steps; i++) {
+          const a = (i / steps) * Math.PI * 2 - Math.PI / 2;
+          let radX = r * 0.96, radY = r * 0.85;
+          let x = cx + Math.cos(a) * radX, y = cy + 3 + Math.sin(a) * radY;
+          const deg = (a * 180) / Math.PI;
+          if (deg > -68 && deg < -22) {
+            const earFactor = Math.sin(((deg + 68) / 46) * Math.PI);
+            x += Math.cos(a - 0.15) * (r * 0.42 * earFactor); y += Math.sin(a - 0.15) * (r * 0.48 * earFactor);
+          }
+          if (deg > 202 && deg < 248) {
+            const earFactor = Math.sin(((deg - 202) / 46) * Math.PI);
+            x += Math.cos(a + 0.15) * (r * 0.42 * earFactor); y += Math.sin(a + 0.15) * (r * 0.48 * earFactor);
+          }
+          pts.push({ x, y });
+        }
+      } else if (type === 'bear') {
+        const steps = 80;
+        for (let i = 0; i < steps; i++) {
+          const a = (i / steps) * Math.PI * 2 - Math.PI / 2;
+          const deg = (a * 180) / Math.PI;
+          let radX = r * 0.92, radY = r * 0.84, bump = 0;
+          if (deg >= -65 && deg <= -20) bump = Math.sin(((deg + 65) / 45) * Math.PI) * (r * 0.34);
+          if (deg >= 200 && deg <= 245) bump = Math.sin(((deg - 200) / 45) * Math.PI) * (r * 0.34);
+          pts.push({ x: cx + Math.cos(a) * (radX + bump), y: cy + 4 + Math.sin(a) * (radY + bump) });
+        }
+      } else if (type === 'bunny') {
+        const steps = 90;
+        for (let i = 0; i < steps; i++) {
+          const a = (i / steps) * Math.PI * 2 - Math.PI / 2;
+          const deg = (a * 180) / Math.PI;
+          let radX = r * 0.85, radY = r * 0.72;
+          let x = cx + Math.cos(a) * radX, y = cy + 10 + Math.sin(a) * radY;
+          if (deg >= -82 && deg <= -48) {
+            const ear = Math.sin(((deg + 82) / 34) * Math.PI);
+            y -= ear * (r * 0.78); x += ear * (r * 0.08);
+          }
+          if (deg >= 228 && deg <= 262) {
+            const ear = Math.sin(((deg - 228) / 34) * Math.PI);
+            y -= ear * (r * 0.78); x -= ear * (r * 0.08);
+          }
+          pts.push({ x, y });
+        }
+      } else if (type === 'cloud') {
+        const steps = 96;
+        for (let i = 0; i < steps; i++) {
+          const a = (i / steps) * Math.PI * 2;
+          const puffs = 6;
+          const puffOffset = Math.abs(Math.sin(a * (puffs / 2))) * (r * 0.22);
+          pts.push({ x: cx + Math.cos(a) * (r * 0.88 + puffOffset), y: cy + Math.sin(a) * (r * 0.68 + puffOffset * 0.85) });
+        }
+      }
+
+      return pts.map((p) => ({ x: Number(p.x.toFixed(2)), y: Number(p.y.toFixed(2)) }));
+    };
+
+    // ============================================================================
+    // 3. STITCHING HOLE PATTERN GENERATOR
+    // ============================================================================
+    const generateStitchingHolesForPolygon = (poly, config) => {
+      if (!poly || poly.length < 3) return [];
+      const { pattern = 'grid', holeDiameter = 3.0, holeSpacing = 8.0, edgeMargin = 6.0, fixedHoles = [], parentPathId = null } = config;
+      const radius = holeDiameter / 2, safeDistance = edgeMargin;
+      const bounds = getPolygonBounds(poly);
+      const generated = [];
+
+      const isFarFromFixed = (pt) => {
+        for (const fh of fixedHoles) {
+          const fBounds = getPolygonBounds(fh.points);
+          if (dist(pt, { x: fBounds.cx, y: fBounds.cy }) < (fBounds.width / 2) + radius + 2.0) return false;
+        }
+        return true;
+      };
+
+      const createHole = (pt) => ({ id: `hole_${generated.length}_${Date.now()}`, x: pt.x, y: pt.y, d: holeDiameter, parentPathId });
+
+      if (pattern === 'grid') {
+        const startX = bounds.cx - Math.floor((bounds.cx - bounds.minX) / holeSpacing) * holeSpacing;
+        const startY = bounds.cy - Math.floor((bounds.cy - bounds.minY) / holeSpacing) * holeSpacing;
+        for (let y = startY; y <= bounds.maxY; y += holeSpacing) {
+          for (let x = startX; x <= bounds.maxX; x += holeSpacing) {
+            const pt = { x: Number(x.toFixed(2)), y: Number(y.toFixed(2)) };
+            if (isPointInPolygon(pt, poly) && minDistToPolygon(pt, poly) >= safeDistance && isFarFromFixed(pt)) generated.push(createHole(pt));
+          }
+        }
+      } else if (pattern === 'honeycomb') {
+        const rowHeight = holeSpacing * Math.sin(Math.PI / 3);
+        const startY = bounds.cy - Math.floor((bounds.cy - bounds.minY) / rowHeight) * rowHeight;
+        const startX = bounds.cx - Math.floor((bounds.cx - bounds.minX) / holeSpacing) * holeSpacing;
+        let rowIdx = 0;
+        for (let y = startY; y <= bounds.maxY; y += rowHeight) {
+          const xOffset = rowIdx % 2 === 0 ? 0 : holeSpacing / 2;
+          for (let x = startX - holeSpacing; x <= bounds.maxX + holeSpacing; x += holeSpacing) {
+            const pt = { x: Number((x + xOffset).toFixed(2)), y: Number(y.toFixed(2)) };
+            if (isPointInPolygon(pt, poly) && minDistToPolygon(pt, poly) >= safeDistance && isFarFromFixed(pt)) generated.push(createHole(pt));
+          }
+          rowIdx++;
+        }
+      } else if (pattern === 'outline') {
+        let totalPerimeter = 0;
+        const segLengths = [];
+        for (let i = 0; i < poly.length; i++) {
+          const d = dist(poly[i], poly[(i + 1) % poly.length]);
+          segLengths.push(d); totalPerimeter += d;
+        }
+        const numHoles = Math.max(3, Math.floor(totalPerimeter / holeSpacing));
+        const actualStep = totalPerimeter / numHoles;
+        let currentTargetDist = 0, accumulated = 0, segIdx = 0;
+
+        for (let k = 0; k < numHoles; k++) {
+          while (segIdx < segLengths.length && accumulated + segLengths[segIdx] < currentTargetDist) {
+            accumulated += segLengths[segIdx]; segIdx++;
+          }
+          if (segIdx >= poly.length) break;
+          const a = poly[segIdx], b = poly[(segIdx + 1) % poly.length];
+          const t = Math.max(0, Math.min(1, (currentTargetDist - accumulated) / (segLengths[segIdx] || 1)));
+          const pt = { x: Number((a.x + (b.x - a.x) * t).toFixed(2)), y: Number((a.y + (b.y - a.y) * t).toFixed(2)) };
+          
+          if (!generated.some((h) => dist(h, pt) < holeSpacing * 0.65) && isFarFromFixed(pt)) {
+             generated.push(createHole(pt));
+          }
+          currentTargetDist += actualStep;
+        }
+      }
+      return generated;
+    };
+
+    // ============================================================================
+    // 4. STANDARD AUTOCAD R12 ASCII .DXF GENERATOR
+    // ============================================================================
+    const generateDXFContent = ({ boardWidth, boardHeight, paths, holes }) => {
+      const lines = [];
+      const pushCode = (code, val) => { lines.push(String(code).trim()); lines.push(String(val).trim()); };
+
+      pushCode(0, 'SECTION'); pushCode(2, 'HEADER');
+      pushCode(9, '$ACADVER'); pushCode(1, 'AC1009');
+      pushCode(9, '$INSUNITS'); pushCode(70, 4);
+      pushCode(9, '$EXTMIN'); pushCode(10, 0.0); pushCode(20, 0.0);
+      pushCode(9, '$EXTMAX'); pushCode(10, boardWidth); pushCode(20, boardHeight);
+      pushCode(0, 'ENDSEC');
+
+      pushCode(0, 'SECTION'); pushCode(2, 'TABLES');
+      pushCode(0, 'TABLE'); pushCode(2, 'LTYPE'); pushCode(70, 1);
+      pushCode(0, 'LTYPE'); pushCode(2, 'CONTINUOUS'); pushCode(70, 64); pushCode(3, 'Solid line'); pushCode(72, 65); pushCode(73, 0); pushCode(40, 0.0);
+      pushCode(0, 'ENDTAB');
+
+      pushCode(0, 'TABLE'); pushCode(2, 'LAYER'); pushCode(70, 2);
+      pushCode(0, 'LAYER'); pushCode(2, 'CUT'); pushCode(70, 0); pushCode(62, 1); pushCode(6, 'CONTINUOUS');
+      pushCode(0, 'LAYER'); pushCode(2, 'ENGRAVE'); pushCode(70, 0); pushCode(62, 5); pushCode(6, 'CONTINUOUS');
+      pushCode(0, 'ENDTAB'); pushCode(0, 'ENDSEC');
+
+      pushCode(0, 'SECTION'); pushCode(2, 'ENTITIES');
+
+      const flipY = (y) => Number((boardHeight - y).toFixed(4));
+      const fmtX = (x) => Number(x.toFixed(4));
+
+      paths.forEach((path) => {
+        if (!path.points || path.points.length < 2) return;
+        const layerName = path.layer === 'cut' ? 'CUT' : 'ENGRAVE';
+        const colorCode = path.layer === 'cut' ? 1 : 5;
+
+        if (path.isFixedHole) {
+          const bounds = getPolygonBounds(path.points);
+          pushCode(0, 'CIRCLE'); pushCode(8, layerName); pushCode(62, colorCode);
+          pushCode(10, fmtX(bounds.cx)); pushCode(20, flipY(bounds.cy)); pushCode(30, 0.0);
+          pushCode(40, Number((bounds.width / 2).toFixed(4)));
+          return;
+        }
+
+        pushCode(0, 'POLYLINE'); pushCode(8, layerName); pushCode(62, colorCode); pushCode(66, 1);
+        pushCode(10, 0.0); pushCode(20, 0.0); pushCode(30, 0.0); pushCode(70, path.closed ? 1 : 0);
+
+        path.points.forEach((pt) => {
+          pushCode(0, 'VERTEX'); pushCode(8, layerName);
+          pushCode(10, fmtX(pt.x)); pushCode(20, flipY(pt.y)); pushCode(30, 0.0);
+        });
+
+        pushCode(0, 'SEQEND'); pushCode(8, layerName);
+      });
+
+      holes.forEach((h) => {
+        pushCode(0, 'CIRCLE'); pushCode(8, 'CUT'); pushCode(62, 1);
+        pushCode(10, fmtX(h.x)); pushCode(20, flipY(h.y)); pushCode(30, 0.0); pushCode(40, Number((h.d / 2).toFixed(4)));
+      });
+
+      pushCode(0, 'ENDSEC'); pushCode(0, 'EOF');
+      return lines.join('\r\n');
+    };
+
+    // ============================================================================
+    // 5. MAIN APPLICATION COMPONENT
+    // ============================================================================
+    function App() {
+      const [projectTitle, setProjectTitle] = useState('나만의 우드 스티칭 보드');
+      const [boardWidth, setBoardWidth] = useState(100);
+      const [boardHeight, setBoardHeight] = useState(100);
+      const [inputW, setInputW] = useState(100);
+      const [inputH, setInputH] = useState(100);
+
+      const [activeLayer, setActiveLayer] = useState('cut');
+      const [activeTool, setActiveTool] = useState('select');
+      const [autoGenerateHoles, setAutoGenerateHoles] = useState(false);
+
+      const [patternType, setPatternType] = useState('grid');
+      const [holeDiameter, setHoleDiameter] = useState(3.0);
+      const [holeSpacing, setHoleSpacing] = useState(8.5);
+      const [edgeMargin, setEdgeMargin] = useState(5.0);
+
+      const [paths, setPaths] = useState([]);
+      const [holes, setHoles] = useState([]);
+
+      const [selectedPathIds, setSelectedPathIds] = useState(new Set());
+      const [marqueeBox, setMarqueeBox] = useState(null);
+
+      const [currentSketch, setCurrentSketch] = useState([]);
+      const [polyPoints, setPolyPoints] = useState([]);
+      
+      // 베지에 곡선펜용 상태 복구!
+      const [bezierNodes, setBezierNodes] = useState([]);
+      const [isDraggingBezier, setIsDraggingBezier] = useState(false);
+      
+      const [isDrawing, setIsDrawing] = useState(false);
+      const [isErasing, setIsErasing] = useState(false);
+      const [mouseMM, setMouseMM] = useState({ x: 50, y: 50 });
+      const [draggingItem, setDraggingItem] = useState(null); 
+      const [history, setHistory] = useState([]);
+      const [toastMsg, setToastMsg] = useState('✨ 환영합니다! 모양을 만들어 보세요.');
+
+      const [showExportModal, setShowExportModal] = useState(false);
+      const [exportWarnings, setExportWarnings] = useState([]);
+      
+      // ✅ 도형 메뉴 열림/닫힘 상태 추가
+      const [showShapeMenu, setShowShapeMenu] = useState(false);
+
+      const svgRef = useRef(null);
+      const showToast = useCallback((msg) => setToastMsg(msg), []);
+
+      const saveHistory = useCallback(() => {
+        setHistory((prev) => [
+          ...prev.slice(-19),
+          { paths: JSON.parse(JSON.stringify(paths)), holes: JSON.parse(JSON.stringify(holes)) }
+        ]);
+      }, [paths, holes]);
+
+      const handleUndo = () => {
+        if (history.length === 0) return;
+        const last = history[history.length - 1];
+        setPaths(last.paths); setHoles(last.holes);
+        setHistory((prev) => prev.slice(0, -1));
+        setSelectedPathIds(new Set());
+        showToast('↩️ 이전 작업 상태로 되돌렸어요!');
+      };
+
+      useEffect(() => {
+        const handleKeyDown = (e) => {
+          if ((e.key === 'Delete' || e.key === 'Backspace') && selectedPathIds.size > 0 && activeTool === 'select' && e.target.tagName !== 'INPUT') {
+            handleDeleteSelectedPaths();
+          }
+        };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+      }, [selectedPathIds, paths, activeTool]);
+
+      const handleDeleteSelectedPaths = () => {
+        if (selectedPathIds.size === 0) return;
+        saveHistory();
+        setPaths(prev => prev.filter(p => !selectedPathIds.has(p.id)));
+        setHoles(prev => prev.filter(h => !selectedPathIds.has(h.parentPathId)));
+        setSelectedPathIds(new Set());
+        showToast('🗑️ 선택한 도형을 삭제했어요.');
+      };
+
+      const getMMCoords = (e) => {
+        if (!svgRef.current) return { x: 0, y: 0 };
+        const rect = svgRef.current.getBoundingClientRect();
+        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+        const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+        const normX = (clientX - rect.left) / rect.width;
+        const normY = (clientY - rect.top) / rect.height;
+        const x = normX * (boardWidth + 16) - 8;
+        const y = normY * (boardHeight + 16) - 8;
+        return {
+          x: Number((Math.max(0, Math.min(boardWidth, x))).toFixed(2)),
+          y: Number((Math.max(0, Math.min(boardHeight, y))).toFixed(2))
+        };
+      };
+
+      const triggerGenerateHoles = useCallback((customConfig = {}) => {
+          const cutPathIds = Array.from(selectedPathIds).filter(id => {
+            const p = paths.find(x => x.id === id);
+            return p && p.layer === 'cut' && p.closed && !p.isFixedHole && !p.isKeyringOuter;
+          });
+          if (cutPathIds.length === 0) {
+            showToast('❗ 구멍을 채울 닫힌 도형(키링 외)을 선택해주세요!'); return;
+          }
+          saveHistory();
+
+          const pType = customConfig.pattern ?? patternType;
+          const hDia = customConfig.holeDiameter ?? holeDiameter;
+          const hSpace = customConfig.holeSpacing ?? holeSpacing;
+          const eMargin = customConfig.edgeMargin ?? edgeMargin;
+          const fHoles = paths.filter(p => p.isFixedHole);
+
+          let newAllHoles = [...holes.filter(h => !cutPathIds.includes(h.parentPathId))];
+          cutPathIds.forEach(id => {
+            const targetPoly = paths.find(p => p.id === id);
+            const newHoles = generateStitchingHolesForPolygon(targetPoly.points, {
+              pattern: pType, holeDiameter: hDia, holeSpacing: hSpace, edgeMargin: eMargin, fixedHoles: fHoles, parentPathId: id
+            });
+            newAllHoles = [...newAllHoles, ...newHoles];
+          });
+          setHoles(newAllHoles);
+          showToast(`🪡 구멍 패턴이 채워졌어요!`);
+      }, [selectedPathIds, patternType, holeDiameter, holeSpacing, edgeMargin, saveHistory, showToast, paths, holes]);
+
+      const applyWorkspaceSize = (w, h) => {
+        const newW = Math.max(20, Math.min(800, w ?? inputW));
+        const newH = Math.max(20, Math.min(800, h ?? inputH));
+        if (newW !== boardWidth || newH !== boardHeight) {
+          saveHistory();
+          const ratioX = newW / boardWidth, ratioY = newH / boardHeight;
+          setBoardWidth(newW); setBoardHeight(newH); setInputW(newW); setInputH(newH);
+          setPaths((prev) => prev.map((p) => {
+            const res = { ...p, points: p.points.map((pt) => ({ x: Number((pt.x * ratioX).toFixed(2)), y: Number((pt.y * ratioY).toFixed(2)) })) };
+            if (p.bezierNodes) res.bezierNodes = p.bezierNodes.map(n => ({ x: n.x * ratioX, y: n.y * ratioY, inX: n.inX * ratioX, inY: n.inY * ratioY, outX: n.outX * ratioX, outY: n.outY * ratioY }));
+            return res;
+          }));
+          setHoles((prev) => prev.map((h) => ({ ...h, x: Number((h.x * ratioX).toFixed(2)), y: Number((h.y * ratioY).toFixed(2)) })));
+          showToast(`📏 작업 영역이 ${newW}x${newH}mm로 변경되었어요.`);
+        }
+      };
+
+      const handleApplyTemplate = (type, label) => {
+        saveHistory();
+        const templatePts = createShapeTemplate(type, Math.min(boardWidth, boardHeight));
+        const newId = `template_${type}_${Date.now()}`;
+        const newPath = { id: newId, name: `${label} 외곽선`, layer: 'cut', closed: true, type: 'polygon', points: templatePts };
+        
+        setPaths(prev => [...prev, newPath]);
+        setSelectedPathIds(new Set([newId]));
+
+        if (autoGenerateHoles) {
+            const fHoles = paths.filter(p => p.isFixedHole);
+            const newHoles = generateStitchingHolesForPolygon(templatePts, { pattern: patternType, holeDiameter, holeSpacing, edgeMargin, fixedHoles: fHoles, parentPathId: newId });
+            setHoles(prev => [...prev, ...newHoles]);
+        }
+        changeTool('select');
+        showToast(`⭐ [${label}] 모양이 추가되었어요!`);
+      };
+
+      const handleAddKeyring = () => {
+          saveHistory();
+          const grpId = `kr_grp_${Date.now()}`;
+          let cx = boardWidth / 2, cy = 15;
+
+          const selCutPaths = paths.filter(p => p.layer === 'cut' && selectedPathIds.has(p.id));
+          if(selCutPaths.length > 0) {
+              const b = getCompoundBounds(selCutPaths);
+              cx = b.cx; cy = b.minY - 2; 
+          }
+
+          const g = r => Array.from({length: 36}).map((_,i)=>({
+              x: Number((cx+Math.cos(i/36*Math.PI*2)*r).toFixed(2)),
+              y: Number((cy+Math.sin(i/36*Math.PI*2)*r).toFixed(2))
+          }));
+          
+          const outer = { id:`kr_o_${Date.now()}`, groupId: grpId, name: '키링 고리', layer:'cut', closed:true, type:'polygon', points:g(6), isKeyringOuter: true };
+          const inner = { id:`kr_i_${Date.now()}`, groupId: grpId, layer:'cut', closed:true, isFixedHole:true, points:g(2) };
+
+          setHoles(prev => prev.filter(h => dist({x: h.x, y: h.y}, {x: cx, y: cy}) > 6.5));
+
+          setPaths(p => [...p, outer, inner]);
+          setSelectedPathIds(new Set([outer.id, inner.id]));
+          changeTool('select');
+          showToast('🔑 키링 고리가 윗부분에 달렸어요. (크기 고정, 이동 가능)');
+      };
+
+      const changeTool = (tool) => {
+        setActiveTool(tool);
+        setPolyPoints([]);
+        if (bezierNodes.length > 1) finishBezierPath(false);
+        else setBezierNodes([]);
+      };
+
+      // === ✒️ 곡선 펜툴 복구 기능 ===
+      const finishBezierPath = (closed = false) => {
+        if (bezierNodes.length < 2) { setBezierNodes([]); return; }
+        saveHistory();
+        const flattened = flattenBezier(bezierNodes, closed);
+        const newId = `bezier_${Date.now()}`;
+        setPaths(prev => [...prev, {
+          id: newId, name: '펜툴 곡선', layer: activeLayer, closed: (closed && flattened.length >= 3),
+          type: 'bezier', bezierNodes: [...bezierNodes], points: flattened
+        }]);
+        if (closed && activeLayer === 'cut') setSelectedPathIds(new Set([newId]));
+        setBezierNodes([]); showToast('✒️ 곡선 펜툴 그리기가 완료되었어요.');
+      };
+
+      const getBezierPathString = () => {
+        if (bezierNodes.length === 0) return '';
+        let d = `M ${bezierNodes[0].x},${bezierNodes[0].y} `;
+        for (let i = 0; i < bezierNodes.length - 1; i++) {
+          const n1 = bezierNodes[i]; const n2 = bezierNodes[i + 1];
+          d += `C ${n1.outX},${n1.outY} ${n2.inX},${n2.inY} ${n2.x},${n2.y} `;
+        }
+        if (!isDraggingBezier && mouseMM) {
+          const last = bezierNodes[bezierNodes.length - 1];
+          d += `Q ${last.outX},${last.outY} ${mouseMM.x},${mouseMM.y} `;
+        }
+        return d;
+      };
+
+      const startDragBezierNode = (e, pathId, nodeIndex, handleType) => {
+        e.stopPropagation(); saveHistory();
+        const p = paths.find(x => x.id === pathId);
+        
+        let actualHandle = handleType;
+        // Alt 키를 누르고 main 점을 드래그하면 핸들을 새로 뽑아내는 모드로 작동
+        if (handleType === 'main' && e.altKey) {
+            actualHandle = 'pull_handles';
+        }
+        
+        setDraggingItem({ type: 'bezierNode', pathId, nodeIndex, handleType: actualHandle, startX: getMMCoords(e).x, startY: getMMCoords(e).y, origNodes: JSON.parse(JSON.stringify(p.bezierNodes)), origPath: p });
+      };
+
+      const resumeBezier = (e, pathId, nodeIndex) => {
+        e.stopPropagation();
+        const p = paths.find(x => x.id === pathId);
+        if (!p) return;
+        saveHistory();
+        let nodesToResume = JSON.parse(JSON.stringify(p.bezierNodes));
+        if (nodeIndex === 0) {
+          nodesToResume = nodesToResume.reverse().map(n => ({ ...n, inX: n.outX, inY: n.outY, outX: n.inX, outY: n.inY }));
+        }
+        setBezierNodes(nodesToResume);
+        setPaths(prev => prev.filter(x => x.id !== pathId));
+        setSelectedPathIds(new Set());
+        setIsDraggingBezier(false);
+        showToast('✒️ 끝점을 연결하여 다시 그리기를 시작합니다.');
+      };
+      // =============================
+
+      const handleCanvasPointerDown = (e) => {
+        const pt = getMMCoords(e);
+        setMouseMM(pt);
+
+        if (activeTool === 'select') {
+          // 바탕화면 클릭 시 기존 선택 해제 및 드래그 박스 시작
+          setSelectedPathIds(new Set());
+          setMarqueeBox({ x1: pt.x, y1: pt.y, x2: pt.x, y2: pt.y });
+        } else if (activeTool === 'sketch') {
+          saveHistory(); setIsDrawing(true); setCurrentSketch([pt]);
+        } else if (activeTool === 'polygon') {
+          if (polyPoints.length >= 3 && dist(pt, polyPoints[0]) < 4.5) { finishPolygonPath(true); return; }
+          setPolyPoints((prev) => [...prev, pt]);
+        } else if (activeTool === 'bezier') {
+          saveHistory();
+          if (selectedPathIds.size > 0) setSelectedPathIds(new Set());
+          if (bezierNodes.length > 0 && dist(pt, bezierNodes[0]) < 4.5) { finishBezierPath(true); return; }
+          setBezierNodes(prev => [...prev, { x: pt.x, y: pt.y, outX: pt.x, outY: pt.y, inX: pt.x, inY: pt.y }]);
+          setIsDraggingBezier(true);
+        } else if (activeTool === 'stamp-add') {
+          saveHistory();
+          setHoles((prev) => [...prev, { id: `manual_hole_${Date.now()}`, x: pt.x, y: pt.y, d: holeDiameter, parentPathId: 'manual' }]);
+        } else if (activeTool === 'stamp-erase') {
+          saveHistory(); setIsErasing(true);
+          setHoles((prev) => prev.filter((h) => dist({ x: h.x, y: h.y }, pt) > holeDiameter / 2 + 2.0));
+        }
+      };
+
+      const handleCanvasPointerMove = (e) => {
+        const pt = getMMCoords(e);
+        setMouseMM(pt);
+
+        if (activeTool === 'select' && marqueeBox) {
+          setMarqueeBox(prev => ({ ...prev, x2: pt.x, y2: pt.y }));
+        } else if (isDrawing && activeTool === 'sketch') {
+          setCurrentSketch((prev) => {
+            const last = prev[prev.length - 1];
+            if (!last || dist(last, pt) > 0.7) return [...prev, pt];
+            return prev;
+          });
+        } else if (activeTool === 'stamp-erase' && isErasing) {
+          setHoles((prev) => prev.filter((h) => dist({ x: h.x, y: h.y }, pt) > holeDiameter / 2 + 2.0));
+        } else if (activeTool === 'bezier' && isDraggingBezier && bezierNodes.length > 0) {
+          setBezierNodes(prev => {
+            const arr = [...prev]; const last = arr[arr.length - 1];
+            last.outX = pt.x; last.outY = pt.y;
+            // 그릴 때 Alt 키를 누르면 반대쪽 핸들은 고정되어 뾰족한 꺾은선 곡선을 그릴 수 있음
+            if (!e.altKey) {
+              last.inX = last.x - (pt.x - last.x); last.inY = last.y - (pt.y - last.y);
+            }
+            return arr;
+          });
+        } else if (draggingItem) {
+          if (draggingItem.type === 'path') {
+            const dx = pt.x - draggingItem.startX;
+            const dy = pt.y - draggingItem.startY;
+            setPaths((prev) => prev.map((p) => {
+              if (!selectedPathIds.has(p.id)) return p;
+              const origP = draggingItem.origPaths.find(op => op.id === p.id);
+              const res = { ...p, points: origP.points.map((opPt) => ({ x: Number((opPt.x + dx).toFixed(2)), y: Number((opPt.y + dy).toFixed(2)) })) };
+              if (p.bezierNodes) {
+                res.bezierNodes = origP.bezierNodes.map(n => ({ x: n.x + dx, y: n.y + dy, inX: n.inX + dx, inY: n.inY + dy, outX: n.outX + dx, outY: n.outY + dy }));
+              }
+              return res;
+            }));
+            setHoles(prev => prev.map(h => {
+               if(selectedPathIds.has(h.parentPathId)) {
+                 const origH = draggingItem.origHoles.find(oh => oh.id === h.id);
+                 if(origH) return { ...h, x: origH.x + dx, y: origH.y + dy };
+               }
+               return h;
+            }));
+          } else if (draggingItem.type === 'resize') {
+            const b = draggingItem.origBounds;
+            const anchorX = draggingItem.handle.includes('w') ? b.maxX : b.minX, anchorY = draggingItem.handle.includes('n') ? b.maxY : b.minY;
+            let newW = Math.max(1, draggingItem.handle.includes('w') ? (anchorX - pt.x) : (pt.x - anchorX));
+            let newH = Math.max(1, draggingItem.handle.includes('n') ? (anchorY - pt.y) : (pt.y - anchorY));
+            let scaleX = newW / b.width, scaleY = newH / b.height;
+            if (e.shiftKey) { const scale = Math.max(scaleX, scaleY); scaleX = scale; scaleY = scale; }
+
+            setPaths(prev => prev.map(p => {
+                 if (!selectedPathIds.has(p.id) || p.isKeyringOuter || p.isFixedHole) return p; 
+                 const origP = draggingItem.origPaths.find(op => op.id === p.id);
+                 const res = { ...p, points: origP.points.map(opPt => ({ x: Number((anchorX + (opPt.x - anchorX) * scaleX).toFixed(2)), y: Number((anchorY + (opPt.y - anchorY) * scaleY).toFixed(2)) })) };
+                 if (p.bezierNodes) {
+                     res.bezierNodes = origP.bezierNodes.map(opN => ({
+                         x: anchorX + (opN.x - anchorX) * scaleX, y: anchorY + (opN.y - anchorY) * scaleY,
+                         inX: anchorX + (opN.inX - anchorX) * scaleX, inY: anchorY + (opN.inY - anchorY) * scaleY,
+                         outX: anchorX + (opN.outX - anchorX) * scaleX, outY: anchorY + (opN.outY - anchorY) * scaleY,
+                     }));
+                 }
+                 return res;
+            }));
+            setHoles(prev => prev.map(h => {
+                 if (!selectedPathIds.has(h.parentPathId)) return h;
+                 const origH = draggingItem.origHoles.find(oh => oh.id === h.id);
+                 return { ...h, x: Number((anchorX + (origH.x - anchorX) * scaleX).toFixed(2)), y: Number((anchorY + (origH.y - anchorY) * scaleY).toFixed(2)) };
+            }));
+          } else if (draggingItem.type === 'bezierNode') {
+            const dx = pt.x - draggingItem.startX;
+            const dy = pt.y - draggingItem.startY;
+            setPaths(prev => prev.map(p => {
+                if (p.id !== draggingItem.pathId) return p;
+                const newNodes = JSON.parse(JSON.stringify(draggingItem.origNodes));
+                const node = newNodes[draggingItem.nodeIndex];
+                
+                if (draggingItem.handleType === 'main') {
+                    node.x += dx; node.y += dy; node.inX += dx; node.inY += dy; node.outX += dx; node.outY += dy;
+                } else if (draggingItem.handleType === 'pull_handles') {
+                    // 메인 점은 고정하고 양쪽 핸들만 뽑아냄
+                    node.outX = pt.x; node.outY = pt.y;
+                    node.inX = node.x - (pt.x - node.x); node.inY = node.y - (pt.y - node.y);
+                } else if (draggingItem.handleType === 'in') {
+                    node.inX = pt.x; node.inY = pt.y;
+                    if (!e.altKey) { // Alt 키를 안 누르면 양방향 대칭
+                        node.outX = node.x - (pt.x - node.x); node.outY = node.y - (pt.y - node.y);
+                    }
+                } else if (draggingItem.handleType === 'out') {
+                    node.outX = pt.x; node.outY = pt.y;
+                    if (!e.altKey) {
+                        node.inX = node.x - (pt.x - node.x); node.inY = node.y - (pt.y - node.y);
+                    }
+                }
+                return { ...p, bezierNodes: newNodes, points: flattenBezier(newNodes, p.closed) };
+            }));
+          }
+        }
+      };
+
+      const handleCanvasPointerUp = () => {
+        if (activeTool === 'select' && marqueeBox) {
+           const xMin = Math.min(marqueeBox.x1, marqueeBox.x2), xMax = Math.max(marqueeBox.x1, marqueeBox.x2);
+           const yMin = Math.min(marqueeBox.y1, marqueeBox.y2), yMax = Math.max(marqueeBox.y1, marqueeBox.y2);
+           if(Math.abs(xMax - xMin) > 1 || Math.abs(yMax - yMin) > 1) {
+               const selected = paths.filter(p => {
+                   const b = getPolygonBounds(p.points);
+                   return !(b.maxX < xMin || b.minX > xMax || b.maxY < yMin || b.minY > yMax);
+               });
+               let finalIds = new Set();
+               selected.forEach(p => {
+                  if(p.groupId) paths.filter(x => x.groupId === p.groupId).forEach(x => finalIds.add(x.id));
+                  else finalIds.add(p.id);
+               });
+               setSelectedPathIds(finalIds);
+           }
+           setMarqueeBox(null);
+        }
+        if (isDrawing && activeTool === 'sketch') {
+          setIsDrawing(false);
+          if (currentSketch.length >= 3) {
+            const simplified = simplifyPath(currentSketch, 0.75);
+            const shouldClose = activeLayer === 'cut' || dist(simplified[0], simplified[simplified.length - 1]) < 10.0;
+            const finalPoints = smoothPath(simplified, shouldClose, 1);
+            const newId = `sketch_${Date.now()}`;
+            setPaths((prev) => [...prev, { id: newId, name: activeLayer === 'cut' ? '스케치 (자르기)' : '스케치 (각인)', layer: activeLayer, closed: shouldClose, type: 'polygon', points: finalPoints }]);
+            if (shouldClose && activeLayer === 'cut') setSelectedPathIds(new Set([newId]));
+          }
+          setCurrentSketch([]);
+        }
+        if (activeTool === 'bezier' && isDraggingBezier) setIsDraggingBezier(false);
+        if (activeTool === 'stamp-erase' && isErasing) setIsErasing(false);
+        if (draggingItem) setDraggingItem(null);
+      };
+
+      const startDragPath = (e, p) => {
+        if (activeTool === 'bezier') {
+          if (p.type === 'bezier') {
+            e.stopPropagation();
+            if (bezierNodes.length > 0) finishBezierPath(false);
+            setSelectedPathIds(new Set([p.id]));
+          }
+          return;
+        }
+        if (activeTool !== 'select') return;
+        e.stopPropagation(); saveHistory();
+        
+        let toSelectIds = p.groupId ? paths.filter(x => x.groupId === p.groupId).map(x => x.id) : [p.id];
+        const newSel = new Set(e.shiftKey ? selectedPathIds : (selectedPathIds.has(p.id) ? selectedPathIds : []));
+        toSelectIds.forEach(id => {
+            if (e.shiftKey && selectedPathIds.has(id)) newSel.delete(id);
+            else newSel.add(id);
+        });
+        setSelectedPathIds(newSel);
+
+        const selPaths = paths.filter(x => newSel.has(x.id)).map(x => JSON.parse(JSON.stringify(x)));
+        const selHoles = holes.filter(h => newSel.has(h.parentPathId)).map(h => ({ ...h }));
+        setDraggingItem({ type: 'path', startX: getMMCoords(e).x, startY: getMMCoords(e).y, origPaths: selPaths, origHoles: selHoles });
+      };
+
+      const startResize = (e, handle, selPaths, b) => {
+        e.stopPropagation(); saveHistory();
+        const origPaths = selPaths.map(p => JSON.parse(JSON.stringify(p)));
+        const origHoles = holes.filter(h => selectedPathIds.has(h.parentPathId)).map(h => ({ ...h }));
+        setDraggingItem({ type: 'resize', handle, startX: getMMCoords(e).x, startY: getMMCoords(e).y, origPaths, origHoles, origBounds: b });
+      };
+
+      const handleMergePaths = () => {
+        const cutPaths = paths.filter(p => p.layer === 'cut' && p.closed && !p.isFixedHole && selectedPathIds.has(p.id));
+        if (cutPaths.length < 2) { showToast('⚠️ 합치려면 2개 이상의 [🔴 자르기] 도형을 선택해주세요!'); return; }
+        
+        if (!window.turf) { showToast('🚨 합치기 도구를 불러오는 중 오류가 발생했습니다.'); return; }
+
+        showToast('⏳ 도형을 안전하게 합치는 중입니다...');
+        try {
+          let unionPoly = null;
+          for (const p of cutPaths) {
+            let coords = p.points.map(pt => [pt.x, pt.y]);
+            if (coords.length < 3) continue;
+            if (coords[0][0] !== coords[coords.length - 1][0] || coords[0][1] !== coords[coords.length - 1][1]) {
+              coords.push([...coords[0]]); 
+            }
+            let poly = turf.polygon([coords]);
+            poly = turf.buffer(poly, 0); 
+            unionPoly = !unionPoly ? poly : turf.union(unionPoly, poly);
+          }
+
+          if (!unionPoly) return;
+          saveHistory();
+
+          const extractPoints = (coordinates) => coordinates.map(c => ({ x: c[0], y: c[1] }));
+          const newMergedPaths = [];
+          
+          const processPolygon = (geomCoords, idxBase) => {
+              geomCoords.forEach((ring, rIdx) => {
+                  const isHole = rIdx > 0;
+                  newMergedPaths.push({
+                      id: `merged_${Date.now()}_${idxBase}_${rIdx}`,
+                      name: isHole ? '합쳐진 내부 구멍' : '합쳐진 외곽선',
+                      layer: 'cut', closed: true, type: 'polygon',
+                      points: extractPoints(ring)
+                  });
+              });
+          };
+
+          if (unionPoly.geometry.type === 'Polygon') {
+              processPolygon(unionPoly.geometry.coordinates, 0);
+          } else if (unionPoly.geometry.type === 'MultiPolygon') {
+              unionPoly.geometry.coordinates.forEach((polyCoords, idx) => processPolygon(polyCoords, idx));
+          }
+
+          const cutPathIds = new Set(cutPaths.map(p => p.id));
+          const preservedFixedHoles = paths.filter(p => p.isFixedHole && selectedPathIds.has(p.id)).map(p => ({...p, groupId: null})); 
+
+          setHoles(prev => prev.filter(h => !cutPathIds.has(h.parentPathId)));
+          setPaths(prev => [...prev.filter(p => !cutPathIds.has(p.id) && !preservedFixedHoles.find(fh => fh.id === p.id)), ...preservedFixedHoles, ...newMergedPaths]);
+          setSelectedPathIds(new Set([...preservedFixedHoles.map(p=>p.id), ...newMergedPaths.map(p=>p.id)]));
+          showToast('✨ 완벽하게 하나로 합쳐졌어요!');
+        } catch (error) {
+          console.error(error); 
+          showToast('🚨 선이 꼬여 있어서 합칠 수 없어요. 겹치는 부분을 더 깊게 하거나 다시 그려볼까요?');
+        }
+      };
+
+      const finishPolygonPath = (closed = true) => {
+        if (polyPoints.length < 2) { setPolyPoints([]); return; }
+        saveHistory();
+        const isClosed = closed && polyPoints.length >= 3;
+        const newId = `poly_${Date.now()}`;
+        setPaths((prev) => [...prev, { id: newId, name: '다각형 외곽선', layer: activeLayer, closed: isClosed, type: 'polygon', points: polyPoints }]);
+        if (isClosed && activeLayer === 'cut') setSelectedPathIds(new Set([newId]));
+        setPolyPoints([]);
+      };
+
+      const toSvgPoints = (pts) => pts.map((p) => `${p.x},${p.y}`).join(' ');
+
+      const preCheckExport = () => {
+          let warns = [];
+          const outOfBounds = paths.some(p => {
+              const b = getPolygonBounds(p.points);
+              return b.minX < 0 || b.maxX > boardWidth || b.minY < 0 || b.maxY > boardHeight;
+          });
+          if (outOfBounds) warns.push('판 바깥으로 튀어나간 도형이 있어요.');
+          
+          const unclosed = paths.some(p => p.layer === 'cut' && !p.closed);
+          if (unclosed) warns.push('완전히 닫히지 않은 자르기(빨간색) 선이 있어서 잘리지 않을 수 있어요.');
+
+          const unmergedKr = paths.some(p => p.isKeyringOuter);
+          if (unmergedKr) warns.push('키링 고리가 다른 몸통 도형과 아직 합쳐지지 않았어요. (선택 후 [합치기] 클릭)');
+
+          if (warns.length > 0) {
+              setExportWarnings(warns); setShowExportModal(true);
+          } else {
+              handleDownloadDXF();
+          }
+      };
+
+      const handleDownloadDXF = () => {
+        if (paths.length === 0 && holes.length === 0) { showToast('⚠️ 내보낼 내용이 없어요!'); return; }
+        const dxfString = generateDXFContent({ boardWidth, boardHeight, paths, holes });
+        const blob = new Blob([dxfString], { type: 'application/dxf;charset=utf-8' });
+        const url = URL.createObjectURL(blob); const a = document.createElement('a');
+        a.href = url; a.download = `${projectTitle.replace(/\s+/g, '_')}.dxf`;
+        document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+      };
+
+      const selectedCutPaths = paths.filter(p => selectedPathIds.has(p.id));
+      let selectionBounds = activeTool === 'select' ? getCompoundBounds(selectedCutPaths) : null;
+      let drawBounds = null;
+      const hasUnresizable = selectedCutPaths.some(p => p.isKeyringOuter || p.isFixedHole);
+      if (selectionBounds) {
+          let pad = (selectionBounds.width < 15 || selectionBounds.height < 15) ? 6 : 0;
+          drawBounds = {
+              minX: selectionBounds.minX - pad, minY: selectionBounds.minY - pad,
+              maxX: selectionBounds.maxX + pad, maxY: selectionBounds.maxY + pad,
+              width: selectionBounds.width + pad * 2, height: selectionBounds.height + pad * 2
+          };
+      }
+      const isSingleBezierSelected = selectedPathIds.size === 1 && paths.find(p => p.id === [...selectedPathIds][0])?.type === 'bezier';
+
+      return (
+        <div className="min-h-screen bg-[#FBFBF9] text-[#111111] flex flex-col font-sans select-none overflow-hidden h-screen">
+          {/* HEADER */}
+          <header className="bg-white border-b-[3px] border-[#111111] px-4 py-2 flex flex-wrap items-center justify-between gap-3 z-20 shrink-0">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-[#111111] text-white font-black text-xl rounded-xl flex items-center justify-center shadow-[2px_2px_0px_#FACC15] border-2 border-[#111111]">M</div>
+              <div className="flex items-center bg-[#FBFBF9] border-2 border-[#111111] rounded-full px-3 py-1 shadow-[2px_2px_0px_#111111] ml-2">
+                <input type="text" value={projectTitle} onChange={(e) => setProjectTitle(e.target.value)} className="bg-transparent font-extrabold text-sm focus:outline-none w-36" placeholder="도안 이름" />
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button onClick={() => applyWorkspaceSize(50, 50)} className="text-[10px] font-black bg-neutral-100 hover:bg-neutral-200 border border-[#111111] rounded-full px-2 py-1">이름고리 50x50</button>
+              <button onClick={() => applyWorkspaceSize(90, 90)} className="text-[10px] font-black bg-neutral-100 hover:bg-neutral-200 border border-[#111111] rounded-full px-2 py-1">컵받침 90x90</button>
+              
+              <div className="flex items-center gap-1 bg-[#FEF9C3] border-2 border-[#111111] rounded-full px-3 py-1 ml-2">
+                <span className="text-[#111111] text-sm">📏</span>
+                <input type="number" value={inputW} onChange={(e)=>setInputW(Number(e.target.value))} onBlur={()=>applyWorkspaceSize()} className="w-10 bg-transparent text-xs font-black text-center focus:outline-none" />
+                <span className="text-[10px] text-[#111111] font-bold">x</span>
+                <input type="number" value={inputH} onChange={(e)=>setInputH(Number(e.target.value))} onBlur={()=>applyWorkspaceSize()} className="w-10 bg-transparent text-xs font-black text-center focus:outline-none" />
+                <span className="text-[10px] font-extrabold mr-1">mm</span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button onClick={handleUndo} disabled={history.length === 0} className="px-3 py-1.5 rounded-full bg-white border-2 border-[#111111] font-extrabold text-xs shadow-[2px_2px_0px_#111111] disabled:opacity-40">↩️ 실행취소</button>
+              <button onClick={preCheckExport} className="px-4 py-1.5 rounded-full bg-[#FDE047] hover:bg-[#FACC15] border-2 border-[#111111] font-black text-sm shadow-[4px_4px_0px_#111111]">📥 DXF 저장</button>
+            </div>
+          </header>
+
+          {/* MAIN LAYOUT */}
+          <div className="flex flex-1 w-full overflow-hidden">
+            
+            {/* LEFT TOOLBAR */}
+            <aside className="w-24 sm:w-32 bg-white border-r-[3px] border-[#111111] flex flex-col items-center py-4 gap-4 z-10 overflow-y-auto shrink-0 shadow-[4px_0px_0px_rgba(0,0,0,0.05)]">
+              <div className="flex flex-col gap-2 w-full px-2">
+                <div className="flex flex-col bg-neutral-200 border-2 border-[#111111] rounded-xl overflow-hidden p-1 gap-1">
+                  <button onClick={() => setActiveLayer('cut')} className={`py-1.5 rounded-lg text-[10px] font-black transition-all ${activeLayer === 'cut' ? 'bg-[#EF4444] text-white shadow-[2px_2px_0px_#111111] border border-[#111111]' : 'text-neutral-500'}`}>자르기🔴</button>
+                  <button onClick={() => setActiveLayer('engrave')} className={`py-1.5 rounded-lg text-[10px] font-black transition-all ${activeLayer === 'engrave' ? 'bg-[#3B82F6] text-white shadow-[2px_2px_0px_#111111] border border-[#111111]' : 'text-neutral-500'}`}>각인하기🔵</button>
+                </div>
+              </div>
+
+              <div className="w-full h-0.5 bg-neutral-200"></div>
+
+              <div className="flex flex-col gap-2 w-full px-2">
+                {[ 
+                  { id: 'select', icon: '👆', label: '선택' }, 
+                  { id: 'sketch', icon: '✏️', label: '자유펜' }, 
+                  { id: 'bezier', icon: '✒️', label: '곡선펜' }, 
+                  { id: 'polygon', icon: '⬠', label: '직선펜' }
+                ].map(t => (
+                  <button key={t.id} onClick={() => changeTool(t.id)} className={`w-full py-2 rounded-xl border-2 border-[#111111] flex flex-col items-center justify-center gap-1 transition-all ${activeTool === t.id ? 'bg-[#111111] text-white shadow-[2px_2px_0px_#FACC15]' : 'bg-white hover:bg-neutral-100 shadow-[2px_2px_0px_#111111]'}`}>
+                    <span className="text-xl leading-none">{t.icon}</span><span className="text-[10px] font-black">{t.label}</span>
+                  </button>
+                ))}
+                
+                {activeTool === 'bezier' && bezierNodes.length > 0 && (
+                  <button onClick={() => finishBezierPath(false)} className="w-full py-2 mt-1 rounded-xl bg-[#8B5CF6] hover:bg-[#7C3AED] text-white border-2 border-[#111111] font-black text-[11px] shadow-[2px_2px_0px_#111111]">✅ 열린완료</button>
+                )}
+                
+                <button onClick={handleMergePaths} className="w-full py-2 mt-1 rounded-xl border-2 border-[#111111] flex flex-col items-center justify-center gap-1 bg-[#FEF08A] hover:bg-[#FDE047] shadow-[2px_2px_0px_#111111] transition-all">
+                  <span className="text-xl leading-none">🔗</span><span className="text-[10px] font-black">합치기</span>
+                </button>
+              </div>
+
+              <div className="w-full h-0.5 bg-neutral-200"></div>
+
+              <div className="flex flex-col gap-1.5 w-full px-2 pb-4">
+                {/* ✅ 단일 도형 추가 버튼으로 변경 */}
+                <button
+                  onClick={() => setShowShapeMenu(!showShapeMenu)}
+                  className="w-full py-3 bg-neutral-50 hover:bg-neutral-200 border-2 border-[#111111] rounded-xl flex flex-col items-center justify-center gap-1 shadow-[2px_2px_0px_#111111] transition-all"
+                >
+                  <span className="text-2xl">⭐</span>
+                  <span className="text-[10px] font-black">도형 추가 {showShapeMenu ? '▴' : '▾'}</span>
+                </button>
+
+                {/* ✅ 누르면 펼쳐지는 도형 목록 */}
+                {showShapeMenu && (
+                  <div className="grid grid-cols-2 gap-1.5 mt-1 bg-neutral-100 p-1.5 border-2 border-[#111111] rounded-xl shadow-inner">
+                    {['circle', 'rounded_rect', 'heart', 'star', 'cat', 'bear', 'bunny', 'cloud'].map(s => (
+                      <button key={s} onClick={() => { handleApplyTemplate(s, '도형'); setShowShapeMenu(false); }} className="aspect-square bg-white hover:bg-neutral-200 border-2 border-[#111111] rounded-lg flex items-center justify-center text-xl shadow-[2px_2px_0px_#111111] transition-all">
+                        {s==='circle'?'⭕':s==='rounded_rect'?'🟦':s==='heart'?'❤️':s==='star'?'⭐':s==='cat'?'🐱':s==='bear'?'🐻':s==='bunny'?'🐰':'☁️'}
+                      </button>
+                    ))}
+                  </div>
+                )}
+                
+                <button onClick={handleAddKeyring} className="w-full py-2 mt-1 bg-[#A7F3D0] hover:bg-[#6EE7B7] border-2 border-[#111111] rounded-xl flex items-center justify-center gap-1 font-extrabold text-[11px] shadow-[2px_2px_0px_#111111]">
+                  🔑 키링달기
+                </button>
+              </div>
+            </aside>
+
+            {/* CANVAS */}
+            <main className="flex-1 flex flex-col items-center justify-center p-4 bg-[#FBFBF9] relative overflow-hidden">
+              <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-[#111111] text-white px-4 py-2 rounded-full font-bold text-sm shadow-lg z-30 transition-all text-center max-w-[80%] break-keep pointer-events-none">
+                {toastMsg}
+              </div>
+
+              <div className="w-full h-full max-h-full max-w-full flex items-center justify-center">
+                 <div className="bg-white border-[4px] border-[#111111] rounded-2xl shadow-[8px_8px_0px_#111111] overflow-hidden relative cursor-crosshair flex-shrink-0" style={{ width: '100%', maxWidth: '80vh', aspectRatio: `${boardWidth + 16} / ${boardHeight + 16}` }}>
+                  <svg ref={svgRef} viewBox={`-8 -8 ${boardWidth + 16} ${boardHeight + 16}`} onPointerDown={handleCanvasPointerDown} onPointerMove={handleCanvasPointerMove} onPointerUp={handleCanvasPointerUp} className="w-full h-full touch-none">
+                    <defs>
+                      <pattern id="grid10mm" width="10" height="10" patternUnits="userSpaceOnUse">
+                        <path d="M 5 0 L 0 0 0 5" fill="none" stroke="#F1F5F9" strokeWidth="0.25" />
+                        <path d="M 10 0 L 0 0 0 10" fill="none" stroke="#CBD5E1" strokeWidth="0.4" />
+                      </pattern>
+                    </defs>
+                    <rect x={-8} y={-8} width={boardWidth + 16} height={boardHeight + 16} fill="#F1F5F9" />
+                    <rect x={0} y={0} width={boardWidth} height={boardHeight} fill="#FFFFFF" stroke="#111111" strokeWidth="0.8" />
+                    <rect x={0} y={0} width={boardWidth} height={boardHeight} fill="url(#grid10mm)" pointerEvents="none" />
+
+                    {/* Paths */}
+                    {paths.map((p) => {
+                      const isSelected = selectedPathIds.has(p.id);
+                      const isCut = p.layer === 'cut';
+                      const strokeColor = isCut ? '#EF4444' : '#3B82F6';
+                      return (
+                        <g key={p.id} onPointerDown={(e) => startDragPath(e, p)} className={activeTool === 'select' ? 'cursor-move' : ''}>
+                          {isSelected && (p.closed ? <polygon points={toSvgPoints(p.points)} fill={isCut ? 'rgba(254,226,226,0.4)' : 'rgba(219,234,254,0.4)'} stroke="#FACC15" strokeWidth="2.8" strokeLinejoin="round" /> : <polyline points={toSvgPoints(p.points)} fill="none" stroke="#FACC15" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round" />)}
+                          {p.closed ? <polygon points={toSvgPoints(p.points)} fill="transparent" stroke={strokeColor} strokeWidth={isSelected ? '1.5' : '1.0'} strokeLinejoin="round" /> : <polyline points={toSvgPoints(p.points)} fill="none" stroke={strokeColor} strokeWidth={isSelected ? '1.5' : '1.0'} strokeLinecap="round" strokeLinejoin="round" />}
+                        </g>
+                      );
+                    })}
+
+                    {/* Editable Bezier Nodes (Single Bezier Selected) */}
+                    {isSingleBezierSelected && activeTool === 'bezier' && !draggingItem && (
+                       <g pointerEvents="all">
+                         {paths.find(p => p.id === [...selectedPathIds][0]).bezierNodes.map((n, i, arr) => {
+                           const pClosed = paths.find(p => p.id === [...selectedPathIds][0]).closed;
+                           const isEndNode = !pClosed && (i === 0 || i === arr.length - 1);
+                           return (
+                             <g key={`edit_bez_${i}`}>
+                               <line x1={n.inX} y1={n.inY} x2={n.x} y2={n.y} stroke="#8B5CF6" strokeWidth="0.5" strokeDasharray="1,1" />
+                               <line x1={n.outX} y1={n.outY} x2={n.x} y2={n.y} stroke="#8B5CF6" strokeWidth="0.5" strokeDasharray="1,1" />
+                               <circle cx={n.inX} cy={n.inY} r="1.5" fill="#C4B5FD" stroke="#8B5CF6" strokeWidth="0.4" className="cursor-pointer" onPointerDown={(e) => startDragBezierNode(e, [...selectedPathIds][0], i, 'in')} />
+                               <circle cx={n.outX} cy={n.outY} r="1.5" fill="#C4B5FD" stroke="#8B5CF6" strokeWidth="0.4" className="cursor-pointer" onPointerDown={(e) => startDragBezierNode(e, [...selectedPathIds][0], i, 'out')} />
+                               <rect x={n.x - 1.8} y={n.y - 1.8} width="3.6" height="3.6" fill="#8B5CF6" stroke="#4C1D95" strokeWidth="0.2" className="cursor-move" onPointerDown={(e) => startDragBezierNode(e, [...selectedPathIds][0], i, 'main')} />
+                               {isEndNode && (
+                                 <g onPointerDown={(e) => resumeBezier(e, [...selectedPathIds][0], i)} className="cursor-pointer">
+                                   <circle cx={n.x + 6} cy={n.y - 6} r="3.5" fill="#10B981" stroke="#111111" strokeWidth="0.5" />
+                                   <line x1={n.x + 4.5} y1={n.y - 6} x2={n.x + 7.5} y2={n.y - 6} stroke="white" strokeWidth="1" />
+                                   <line x1={n.x + 6} y1={n.y - 7.5} x2={n.x + 6} y2={n.y - 4.5} stroke="white" strokeWidth="1" />
+                                 </g>
+                               )}
+                             </g>
+                           );
+                         })}
+                       </g>
+                    )}
+
+                    {/* Resize Handles */}
+                    {selectedPathIds.size > 0 && activeTool === 'select' && !draggingItem && drawBounds && (() => {
+                         const b = drawBounds;
+                         return (
+                             <g>
+                                 <rect x={b.minX} y={b.minY} width={b.width} height={b.height} fill="none" stroke="#111111" strokeWidth="0.5" strokeDasharray="2,2" pointerEvents="none" />
+                                 {!hasUnresizable && (
+                                   <>
+                                     <rect x={b.minX - 3} y={b.minY - 3} width="6" height="6" fill="#FACC15" stroke="#111111" strokeWidth="0.6" className="cursor-nwse-resize" onPointerDown={(e) => startResize(e, 'nw', selectedCutPaths, b)} />
+                                     <rect x={b.maxX - 3} y={b.minY - 3} width="6" height="6" fill="#FACC15" stroke="#111111" strokeWidth="0.6" className="cursor-nesw-resize" onPointerDown={(e) => startResize(e, 'ne', selectedCutPaths, b)} />
+                                     <rect x={b.minX - 3} y={b.maxY - 3} width="6" height="6" fill="#FACC15" stroke="#111111" strokeWidth="0.6" className="cursor-nesw-resize" onPointerDown={(e) => startResize(e, 'sw', selectedCutPaths, b)} />
+                                     <rect x={b.maxX - 3} y={b.maxY - 3} width="6" height="6" fill="#FACC15" stroke="#111111" strokeWidth="0.6" className="cursor-nwse-resize" onPointerDown={(e) => startResize(e, 'se', selectedCutPaths, b)} />
+                                   </>
+                                 )}
+                             </g>
+                         );
+                    })()}
+
+                    {/* Holes */}
+                    {holes.map((h) => <circle key={h.id} cx={h.x} cy={h.y} r={h.d / 2} fill="#FFFFFF" stroke="#EF4444" strokeWidth="0.75" pointerEvents="none" />)}
+                    
+                    {/* Marquee */}
+                    {marqueeBox && <rect x={Math.min(marqueeBox.x1, marqueeBox.x2)} y={Math.min(marqueeBox.y1, marqueeBox.y2)} width={Math.abs(marqueeBox.x2 - marqueeBox.x1)} height={Math.abs(marqueeBox.y2 - marqueeBox.y1)} fill="rgba(59, 130, 246, 0.15)" stroke="#3B82F6" strokeWidth="0.8" strokeDasharray="2,2" pointerEvents="none" />}
+
+                    {/* Draw Overlays */}
+                    {isDrawing && currentSketch.length > 1 && <polyline points={toSvgPoints(currentSketch)} fill="none" stroke={activeLayer === 'cut' ? '#EF4444' : '#3B82F6'} strokeWidth="1.1" strokeDasharray="1.5,1" pointerEvents="none" />}
+                    {activeTool === 'polygon' && polyPoints.length > 0 && <polyline points={toSvgPoints([...polyPoints, mouseMM])} fill="none" stroke={activeLayer === 'cut' ? '#EF4444' : '#3B82F6'} strokeWidth="1.0" strokeDasharray="1.5,1.5" pointerEvents="none" />}
+                    
+                    {/* In Progress Bezier Overlay */}
+                    {activeTool === 'bezier' && (
+                      <g pointerEvents="none">
+                        <path d={getBezierPathString()} fill="none" stroke={activeLayer === 'cut' ? '#EF4444' : '#3B82F6'} strokeWidth="1.1" strokeLinecap="round" />
+                        {bezierNodes.map((n, i) => (
+                          <g key={`bez_tmp_${i}`}>
+                            <line x1={n.inX} y1={n.inY} x2={n.x} y2={n.y} stroke="#8B5CF6" strokeWidth="0.5" strokeDasharray="1,1" />
+                            <line x1={n.outX} y1={n.outY} x2={n.x} y2={n.y} stroke="#8B5CF6" strokeWidth="0.5" strokeDasharray="1,1" />
+                            <circle cx={n.inX} cy={n.inY} r="1.2" fill="#C4B5FD" stroke="#8B5CF6" strokeWidth="0.4" />
+                            <circle cx={n.outX} cy={n.outY} r="1.2" fill="#C4B5FD" stroke="#8B5CF6" strokeWidth="0.4" />
+                            <rect x={n.x - 1.5} y={n.y - 1.5} width="3" height="3" fill="#8B5CF6" stroke="#4C1D95" strokeWidth="0.2" />
+                          </g>
+                        ))}
+                      </g>
+                    )}
+
+                    {activeTool === 'stamp-add' && <circle cx={mouseMM.x} cy={mouseMM.y} r={holeDiameter / 2} fill="rgba(250, 204, 21, 0.45)" stroke="#EF4444" strokeWidth="0.6" strokeDasharray="1,1" pointerEvents="none" />}
+                    {activeTool === 'stamp-erase' && <circle cx={mouseMM.x} cy={mouseMM.y} r={holeDiameter / 2 + 2.0} fill="rgba(239, 68, 68, 0.2)" stroke="#DC2626" strokeWidth="0.8" strokeDasharray="1,1" pointerEvents="none" />}
+                  </svg>
+                </div>
+              </div>
+            </main>
+
+            {/* RIGHT STITCHING PANEL */}
+            <aside className="w-64 lg:w-72 bg-white border-l-[3px] border-[#111111] flex flex-col p-4 z-10 overflow-y-auto shrink-0">
+              <div className="bg-[#FBFBF9] border-[3px] border-[#111111] rounded-2xl p-4 shadow-[4px_4px_0px_#111111] mb-4">
+                
+                {/* Auto Generate Toggle */}
+                <div className="flex items-center justify-between bg-white border-2 border-[#111111] p-2 rounded-xl mb-4 shadow-[2px_2px_0px_#111111]">
+                   <span className="text-[11px] font-black text-neutral-700">자동 구멍 생성 (ON/OFF)</span>
+                   <button onClick={() => setAutoGenerateHoles(!autoGenerateHoles)} className={`w-10 h-5 rounded-full border-2 border-[#111111] relative transition-colors ${autoGenerateHoles ? 'bg-[#FDE047]' : 'bg-neutral-300'}`}>
+                      <div className={`absolute top-0.5 w-3 h-3 bg-[#111111] rounded-full transition-all ${autoGenerateHoles ? 'left-5' : 'left-1'}`}></div>
+                   </button>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 mb-4">
+                  <button onClick={() => setActiveTool(activeTool === 'stamp-add' ? 'select' : 'stamp-add')} className={`py-1.5 rounded-xl border-2 border-[#111111] font-extrabold text-[10px] ${activeTool === 'stamp-add' ? 'bg-[#111111] text-white' : 'bg-[#FEF08A]'}`}>📍 직접 뚫기</button>
+                  <button onClick={() => setActiveTool(activeTool === 'stamp-erase' ? 'select' : 'stamp-erase')} className={`py-1.5 rounded-xl border-2 border-[#111111] font-extrabold text-[10px] ${activeTool === 'stamp-erase' ? 'bg-[#111111] text-white' : 'bg-[#FEE2E2]'}`}>🧽 지우개</button>
+                </div>
+
+                <div className="space-y-4 bg-white border-2 border-[#111111] rounded-xl p-3 mb-4">
+                  <div>
+                    <span className="text-[10px] font-extrabold block mb-1">배열 패턴</span>
+                    <div className="grid grid-cols-3 gap-1">
+                      {['grid', 'honeycomb', 'outline'].map(pt => (
+                        <button key={pt} onClick={() => setPatternType(pt)} className={`py-1 rounded border-2 border-[#111111] text-[9px] font-bold ${patternType === pt ? 'bg-[#111111] text-white' : 'bg-neutral-50'}`}>{pt === 'grid' ? '바둑판' : pt === 'honeycomb' ? '지그재그' : '테두리'}</button>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="flex justify-between items-center mb-1"><span className="text-[10px] font-extrabold">구멍 크기 (mm)</span><span className="text-[10px] font-black">{holeDiameter.toFixed(1)}</span></div>
+                    <input type="range" min="1.0" max="8.0" step="0.1" value={holeDiameter} onChange={(e) => setHoleDiameter(parseFloat(e.target.value))} className="w-full accent-[#111111]" />
+                  </div>
+                  <div>
+                    <div className="flex justify-between items-center mb-1"><span className="text-[10px] font-extrabold">구멍 간격 (mm)</span><span className="text-[10px] font-black">{holeSpacing.toFixed(1)}</span></div>
+                    <input type="range" min="2.0" max="25.0" step="0.1" value={holeSpacing} onChange={(e) => setHoleSpacing(parseFloat(e.target.value))} className="w-full accent-[#111111]" />
+                  </div>
+                  <div>
+                    <div className="flex justify-between items-center mb-1"><span className="text-[10px] font-extrabold">안전 여백 (mm)</span><span className="text-[10px] font-black">{edgeMargin.toFixed(1)}</span></div>
+                    <input type="range" min="0.5" max="10.0" step="0.5" value={edgeMargin} onChange={(e) => setEdgeMargin(parseFloat(e.target.value))} className="w-full accent-[#111111]" />
+                  </div>
+                </div>
+
+                <button onClick={() => triggerGenerateHoles()} className="w-full py-2.5 rounded-xl bg-[#FDE047] hover:bg-[#FACC15] border-2 border-[#111111] font-black text-xs shadow-[4px_4px_0px_#111111] transition-all">
+                  ✨ 선택 도형에 채우기
+                </button>
+              </div>
+
+              <div className="flex-1"></div>
+
+          <div className="bg-[#FEF9C3] border-2 border-[#111111] rounded-xl p-3 shadow-[2px_2px_0px_#111111] mb-4">
+            <p className="text-[11px] font-bold text-[#111111] leading-relaxed">
+              <strong className="block mb-1">💡 꿀팁 가이드:</strong>
+              • 크기 조절 시 <strong>Shift 키</strong>를 누르면 비율 고정<br/>
+              • 다중 선택은 빈 곳 드래그 또는 <strong>Shift+클릭</strong><br/>
+              • 뾰족한 점에서 핸들 꺼내기: <strong>Alt 누른 채 점 끌기</strong><br/>
+              • 핸들 꺾기: <strong>Alt 누른 채 핸들 끌기</strong>
+            </p>
+          </div>
+        </aside>
+      </div>
+
+      {/* EXPORT WARNING MODAL */}
+          {showExportModal && (
+            <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
+               <div className="bg-white border-[4px] border-[#111111] rounded-2xl p-6 shadow-[12px_12px_0px_#111111] max-w-sm w-full relative">
+                  <h2 className="text-xl font-black mb-2 text-[#EF4444]">⚠️ 저장하기 전 확인!</h2>
+                  <p className="text-[12px] font-bold text-neutral-600 mb-4">아래 문제 때문에 레이저 커터가 제대로 자르지 못할 수 있어요.</p>
+                  <ul className="list-disc pl-5 text-[13px] font-bold text-[#111111] mb-6 space-y-2 bg-[#FEE2E2] p-3 rounded-lg border-2 border-[#111111]">
+                     {exportWarnings.map((w,i) => <li key={i}>{w}</li>)}
+                  </ul>
+                  <div className="flex gap-2">
+                     <button onClick={() => setShowExportModal(false)} className="flex-1 py-2.5 bg-neutral-200 hover:bg-neutral-300 border-2 border-[#111111] rounded-xl font-bold text-[13px]">취소하고 고치기</button>
+                     <button onClick={() => { setShowExportModal(false); handleDownloadDXF(); }} className="flex-1 py-2.5 bg-[#FDE047] hover:bg-[#FACC15] border-2 border-[#111111] rounded-xl font-black text-[13px]">그래도 저장할래요</button>
+                  </div>
+               </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
