@@ -136,7 +136,7 @@
 
     const smoothPath = (points, closed = false, iterations = 1) => {
       if (points.length < 3) return points;
-      let current = cleanPolygonPoints(points, 0.1);
+      let current = cleanPolygonPoints(points, 0.05);
       if (current.length < 3) return points;
       for (let iter = 0; iter < iterations; iter++) {
         const next = [];
@@ -152,7 +152,7 @@
         if (!closed) next.push(current[len - 1]);
         current = next;
       }
-      return cleanPolygonPoints(current, 0.05);
+      return closed ? cleanPolygonPoints(current, 0.05) : current;
     };
 
     // 베지에 곡선을 다각형 점 배열로 변환 (해상도를 32단계로 높이고 중복 점 방지)
@@ -161,7 +161,6 @@
       const steps = 32; 
       if (!nodes || nodes.length === 0) return rawResult;
 
-      // 시작점과 마지막 점이 거의 같으면 닫힌 도형에서 중복 세그먼트 방지
       let workNodes = [...nodes];
       if (closed && workNodes.length > 2 && dist(workNodes[0], workNodes[workNodes.length - 1]) < 0.2) {
         workNodes.pop();
@@ -173,7 +172,6 @@
         const n2 = workNodes[(i + 1) % workNodes.length];
         const p0 = { x: n1.x, y: n1.y }, p1 = { x: n1.outX, y: n1.outY }, p2 = { x: n2.inX, y: n2.inY }, p3 = { x: n2.x, y: n2.y };
         
-        // 직선에 가까운 세그먼트인지 확인
         const isStraight = dist(p0, p1) < 0.05 && dist(p2, p3) < 0.05;
         const curSteps = isStraight ? 1 : steps;
 
@@ -193,7 +191,7 @@
     };
 
     // ============================================================================
-    // 2. PRESET SHAPE TEMPLATES (Size: 60% of workspace, Clean Non-Duplicate Vertices)
+    // 2. PRESET SHAPE TEMPLATES
     // ============================================================================
     const createShapeTemplate = (type, boardSize = 100) => {
       const cx = boardSize / 2;
@@ -621,7 +619,7 @@
         else setBezierNodes([]);
       };
 
-      // === ✒️ 곡선 펜툴 완료 함수 (중복 노드 제거 및 부드러운 닫기) ===
+      // === ✒️ 곡선 펜툴 완료 함수 ===
       const finishBezierPath = (closed = false) => {
         if (bezierNodes.length < 2) { setBezierNodes([]); return; }
         saveHistory();
@@ -701,7 +699,6 @@
         } else if (activeTool === 'bezier') {
           saveHistory();
           if (selectedPathIds.size > 0) setSelectedPathIds(new Set());
-          // 시작점 근처(4.5mm 이내) 클릭 시 새 노드를 추가하지 않고 즉시 닫기 처리!
           if (bezierNodes.length >= 2 && dist(pt, bezierNodes[0]) < 4.5) {
             finishBezierPath(true);
             return;
@@ -724,9 +721,11 @@
         if (activeTool === 'select' && marqueeBox) {
           setMarqueeBox(prev => ({ ...prev, x2: pt.x, y2: pt.y }));
         } else if (isDrawing && activeTool === 'sketch') {
+          // ★ 짧은 각인 선도 정밀하게 인식하도록 샘플링 거리를 0.25mm로 세밀화
+          const minMoveDist = activeLayer === 'engrave' ? 0.2 : 0.45;
           setCurrentSketch((prev) => {
             const last = prev[prev.length - 1];
-            if (!last || dist(last, pt) > 0.6) return [...prev, pt];
+            if (!last || dist(last, pt) > minMoveDist) return [...prev, pt];
             return prev;
           });
         } else if (activeTool === 'stamp-erase' && isErasing) {
@@ -816,7 +815,7 @@
         }
       };
 
-      const handleCanvasPointerUp = () => {
+      const handleCanvasPointerUp = (e) => {
         if (activeTool === 'select' && marqueeBox) {
            const xMin = Math.min(marqueeBox.x1, marqueeBox.x2), xMax = Math.max(marqueeBox.x1, marqueeBox.x2);
            const yMin = Math.min(marqueeBox.y1, marqueeBox.y2), yMax = Math.max(marqueeBox.y1, marqueeBox.y2);
@@ -836,14 +835,35 @@
         }
         if (isDrawing && activeTool === 'sketch') {
           setIsDrawing(false);
-          if (currentSketch.length >= 3) {
-            const simplified = simplifyPath(currentSketch, 0.55);
-            const shouldClose = activeLayer === 'cut' || dist(simplified[0], simplified[simplified.length - 1]) < 10.0;
-            const finalPoints = smoothPath(simplified, shouldClose, 1);
-            if (finalPoints.length >= 3) {
-              const newId = `sketch_${Date.now()}`;
-              setPaths((prev) => [...prev, { id: newId, name: activeLayer === 'cut' ? '스케치 (자르기)' : '스케치 (각인)', layer: activeLayer, closed: shouldClose, type: 'polygon', points: finalPoints }]);
-              if (shouldClose && activeLayer === 'cut') {
+          let sketchPts = [...currentSketch];
+          // 마우스를 뗄 때의 마지막 좌표도 반영하여 아주 짧은 획도 놓치지 않게 처리
+          if (sketchPts.length === 1 && mouseMM) {
+            if (dist(sketchPts[0], mouseMM) > 0.15) {
+              sketchPts.push(mouseMM);
+            } else if (activeLayer === 'engrave') {
+              // 각인 모드에서 콕! 찍기만 해도 작은 점(0.4mm 선분)으로 찍히도록 허용
+              sketchPts.push({ x: Number((sketchPts[0].x + 0.4).toFixed(2)), y: sketchPts[0].y });
+            }
+          }
+
+          if (activeLayer === 'engrave') {
+            // ★ 각인(Engrave) 선: 2개 이상의 점만 있으면 아무리 짧아도 그대로 그려짐!
+            if (sketchPts.length >= 2) {
+              const simplified = sketchPts.length > 3 ? simplifyPath(sketchPts, 0.25) : sketchPts;
+              const finalPoints = simplified.length >= 3 ? smoothPath(simplified, false, 1) : simplified;
+              if (finalPoints.length >= 2) {
+                const newId = `sketch_${Date.now()}`;
+                setPaths((prev) => [...prev, { id: newId, name: '스케치 (각인)', layer: 'engrave', closed: false, type: 'polygon', points: finalPoints }]);
+              }
+            }
+          } else {
+            // ★ 자르기(Cut) 선: 닫힌 도형을 만들기 위해 최소 3개 이상의 점 필요
+            if (sketchPts.length >= 3) {
+              const simplified = simplifyPath(sketchPts, 0.55);
+              const finalPoints = smoothPath(simplified, true, 1);
+              if (finalPoints.length >= 3) {
+                const newId = `sketch_${Date.now()}`;
+                setPaths((prev) => [...prev, { id: newId, name: '스케치 (자르기)', layer: 'cut', closed: true, type: 'polygon', points: finalPoints }]);
                 setSelectedPathIds(new Set([newId]));
                 if (autoGenerateHoles) {
                   const fHoles = paths.filter(p => p.isFixedHole);
@@ -893,37 +913,30 @@
       };
 
       // ============================================================================
-      // ★ 개선된 도형 합치기 (자유펜/곡선펜/기본도형 왜곡 0% 순수 평면 병합 엔진)
+      // ★ 도형 합치기 (자유펜/곡선펜/기본도형 왜곡 0% 순수 평면 병합 엔진)
       // ============================================================================
       const pathToTurfFeatures = (p) => {
-        // 1. 베지에 곡선이면 최신 노드로 고해상도 점 재계산 후 중복점 정리
         const rawPts = (p.type === 'bezier' && p.bezierNodes)
           ? flattenBezier(p.bezierNodes, true)
           : p.points;
         let pts = cleanPolygonPoints(rawPts, 0.05);
         if (pts.length < 3) return [];
 
-        // 2. 와인딩 방향(시계/반시계) 통일: GeoJSON 표준 반시계 방향으로 정렬
         if (getSignedArea(pts) < 0) {
           pts = [...pts].reverse();
         }
 
-        // 3. 폐곡선 링 생성 (첫 점과 끝 점 정확히 일치)
         const ring = pts.map(pt => [Number(pt.x.toFixed(3)), Number(pt.y.toFixed(3))]);
         ring.push([ring[0][0], ring[0][1]]);
 
         let poly = turf.polygon([ring]);
 
-        // 4. turf.buffer(poly, 0)는 지구 곡률(위경도) 왜곡을 일으키므로 절대 사용하지 않음!
-        // 대신 자기 교차(8자 꼬임 등)가 있는 자유펜/곡선펜 도형은 unkinkPolygon으로 평면 분할 정리
         try {
           const unkinked = turf.unkinkPolygon(poly);
           if (unkinked && unkinked.features && unkinked.features.length > 0) {
             return unkinked.features.map(f => turf.rewind(f, { reverse: false }));
           }
-        } catch (err) {
-          // unkink 실패 시 원본 유지
-        }
+        } catch (err) {}
         return [turf.rewind(poly, { reverse: false })];
       };
 
@@ -960,7 +973,6 @@
 
           saveHistory();
 
-          // 폐곡선 링에서 마지막 중복 닫기 점을 제거하여 깔끔한 정점 배열로 변환
           const extractRingPoints = (ringCoords) => {
             if (!ringCoords || ringCoords.length === 0) return [];
             let pts = ringCoords.map(c => ({ x: Number(c[0].toFixed(2)), y: Number(c[1].toFixed(2)) }));
@@ -998,10 +1010,8 @@
             .filter(p => p.isFixedHole && selectedPathIds.has(p.id))
             .map(p => ({ ...p, groupId: null }));
 
-          // 합쳐진 원본 도형들의 구멍 정리
           let remainingHoles = holes.filter(h => !cutPathIds.has(h.parentPathId));
           
-          // 자동 구멍 생성이 켜져 있으면 합쳐진 새 외곽선에 자동으로 구멍 다시 채우기
           if (autoGenerateHoles) {
             const allFixedHoles = [...paths.filter(p => p.isFixedHole && !selectedPathIds.has(p.id)), ...preservedFixedHoles];
             newMergedPaths.forEach(mp => {
@@ -1035,7 +1045,7 @@
         const cleaned = cleanPolygonPoints(polyPoints, 0.05);
         const isClosed = closed && cleaned.length >= 3;
         const newId = `poly_${Date.now()}`;
-        setPaths((prev) => [...prev, { id: newId, name: '다각형 외곽선', layer: activeLayer, closed: isClosed, type: 'polygon', points: cleaned }]);
+        setPaths((prev) => [...prev, { id: newId, name: '다각형 외곽선', layer: activeLayer, closed: isClosed, type: 'polygon', points: cleaned.length >= 2 ? cleaned : polyPoints }]);
         if (isClosed && activeLayer === 'cut') {
           setSelectedPathIds(new Set([newId]));
           if (autoGenerateHoles) {
@@ -1155,6 +1165,9 @@
                 {activeTool === 'bezier' && bezierNodes.length > 0 && (
                   <button onClick={() => finishBezierPath(false)} className="w-full py-2 mt-1 rounded-xl bg-[#8B5CF6] hover:bg-[#7C3AED] text-white border-2 border-[#111111] font-black text-[11px] shadow-[2px_2px_0px_#111111]">✅ 열린선 완료</button>
                 )}
+                {activeTool === 'polygon' && polyPoints.length > 1 && (
+                  <button onClick={() => finishPolygonPath(false)} className="w-full py-2 mt-1 rounded-xl bg-[#3B82F6] hover:bg-[#2563EB] text-white border-2 border-[#111111] font-black text-[11px] shadow-[2px_2px_0px_#111111]">✅ 열린선 완료</button>
+                )}
                 
                 <button onClick={handleMergePaths} className="w-full py-2 mt-1 px-2.5 rounded-xl border-2 border-[#111111] flex items-center justify-center gap-1.5 bg-[#FEF08A] hover:bg-[#FDE047] shadow-[2px_2px_0px_#111111] transition-all">
                   <span className="text-base leading-none">🔗</span><span className="text-[11px] font-black">도형 합치기</span>
@@ -1226,6 +1239,8 @@
                       return (
                         <g key={p.id} onPointerDown={(e) => startDragPath(e, p)} className={activeTool === 'select' ? 'cursor-move' : ''}>
                           {isSelected && (p.closed ? <polygon points={toSvgPoints(p.points)} fill={isCut ? 'rgba(254,226,226,0.4)' : 'rgba(219,234,254,0.4)'} stroke="#FACC15" strokeWidth="2.8" strokeLinejoin="round" /> : <polyline points={toSvgPoints(p.points)} fill="none" stroke="#FACC15" strokeWidth="2.8" strokeLinecap="round" strokeLinejoin="round" />)}
+                          {/* 열린 각인 선도 마우스로 쉽게 클릭/선택할 수 있도록 투명 히트 영역 추가 */}
+                          {!p.closed && <polyline points={toSvgPoints(p.points)} fill="none" stroke="rgba(0,0,0,0.001)" strokeWidth="4.0" strokeLinecap="round" strokeLinejoin="round" />}
                           {p.closed ? <polygon points={toSvgPoints(p.points)} fill="rgba(0,0,0,0.001)" stroke={strokeColor} strokeWidth={isSelected ? '1.5' : '1.0'} strokeLinejoin="round" /> : <polyline points={toSvgPoints(p.points)} fill="none" stroke={strokeColor} strokeWidth={isSelected ? '1.5' : '1.0'} strokeLinecap="round" strokeLinejoin="round" />}
                         </g>
                       );
@@ -1282,7 +1297,7 @@
                     {marqueeBox && <rect x={Math.min(marqueeBox.x1, marqueeBox.x2)} y={Math.min(marqueeBox.y1, marqueeBox.y2)} width={Math.abs(marqueeBox.x2 - marqueeBox.x1)} height={Math.abs(marqueeBox.y2 - marqueeBox.y1)} fill="rgba(59, 130, 246, 0.15)" stroke="#3B82F6" strokeWidth="0.8" strokeDasharray="2,2" pointerEvents="none" />}
 
                     {/* Draw Overlays */}
-                    {isDrawing && currentSketch.length > 1 && <polyline points={toSvgPoints(currentSketch)} fill="none" stroke={activeLayer === 'cut' ? '#EF4444' : '#3B82F6'} strokeWidth="1.1" strokeDasharray="1.5,1" pointerEvents="none" />}
+                    {isDrawing && currentSketch.length >= 1 && <polyline points={toSvgPoints(currentSketch.length === 1 ? [currentSketch[0], mouseMM] : currentSketch)} fill="none" stroke={activeLayer === 'cut' ? '#EF4444' : '#3B82F6'} strokeWidth="1.1" strokeDasharray="1.5,1" pointerEvents="none" />}
                     {activeTool === 'polygon' && polyPoints.length > 0 && (
                       <g pointerEvents="none">
                         <polyline points={toSvgPoints([...polyPoints, mouseMM])} fill="none" stroke={activeLayer === 'cut' ? '#EF4444' : '#3B82F6'} strokeWidth="1.0" strokeDasharray="1.5,1.5" />
